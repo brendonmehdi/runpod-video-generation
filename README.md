@@ -147,6 +147,37 @@ docker build --build-arg HUGGINGFACE_ACCESS_TOKEN=your_hf_token_here -t your-ima
 }
 ```
 
+### Batch Image-to-Video Generation
+Submit multiple independent jobs in a single request by using the `jobs` array. Each job can include its own workflow and optional image uploads. All completed videos are returned individually **and** bundled into a single base64-encoded ZIP archive for easy download.
+
+```json
+{
+  "input": {
+    "zip_outputs": true,
+    "jobs": [
+      {
+        "job_label": "ali",
+        "workflow": { /* workflow JSON */ },
+        "images": [
+          { "name": "ali_01.png", "image": "data:image/png;base64,..." }
+        ]
+      },
+      {
+        "job_label": "ahmed",
+        "workflow": { /* workflow JSON */ },
+        "images": [
+          { "name": "ahmed_01.png", "image": "data:image/png;base64,..." }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- Each job runs sequentially on the worker that picked up the request, so you can send separate requests per batch to utilize multiple GPUs in parallel.
+- The response will contain a `jobs` array describing success/errors per batch and a `zip_file` entry with the combined videos (base64 ZIP). Decode the ZIP locally to download every generated video at once.
+- If `BUCKET_ENDPOINT_URL` is configured, each artifact is also uploaded to S3 and the response contains presigned URLs.
+
 ## Output Processing
 
 ### Converting Base64 to Video

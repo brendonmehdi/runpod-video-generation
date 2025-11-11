@@ -170,3 +170,10 @@ This example uses a simplified workflow (replace with your actual workflow JSON)
   "status": "COMPLETED"
 }
 ```
+
+## Batch Mode & Zipped Outputs
+
+- Set `input.jobs` to an array of workflow definitions to process multiple image-to-video batches in a single RunPod request.
+- Each job can provide its own `job_label`, `workflow`, and optional `images`.
+- The handler returns detailed results per job under `output.jobs[]` and automatically builds a `zip_file` entry containing all generated videos (base64 ZIP). Decode this ZIP locally to download the full batch.
+- When S3 uploads are configured via `BUCKET_ENDPOINT_URL`, the response also includes presigned URLs for each artifact.

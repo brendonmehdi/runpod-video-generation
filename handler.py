@@ -13,6 +13,7 @@ import uuid
 import tempfile
 import socket
 import traceback
+import zipfile
 
 # Time to wait between API check attempts in milliseconds
 COMFY_API_AVAILABLE_INTERVAL_MS = 50
@@ -127,6 +128,27 @@ def _attempt_websocket_reconnect(ws_url, max_attempts, delay_s, initial_error):
     )
 
 
+def _validate_images_field(images, context_label="input"):
+    """Shared validation helper for image upload payloads."""
+    if images is None:
+        return [], None
+
+    if not isinstance(images, list):
+        return (
+            None,
+            f"'images' in {context_label} must be a list of objects with 'name' and 'image' keys",
+        )
+
+    for idx, image in enumerate(images, start=1):
+        if not isinstance(image, dict) or "name" not in image or "image" not in image:
+            return (
+                None,
+                f"'images[{idx}]' in {context_label} must contain 'name' and 'image' keys",
+            )
+
+    return images, None
+
+
 def validate_input(job_input):
     """
     Validates the input for the handler function.
@@ -138,35 +160,78 @@ def validate_input(job_input):
         tuple: A tuple containing the validated data and an error message, if any.
                The structure is (validated_data, error_message).
     """
-    # Validate if job_input is provided
     if job_input is None:
         return None, "Please provide input"
 
-    # Check if input is a string and try to parse it as JSON
     if isinstance(job_input, str):
         try:
             job_input = json.loads(job_input)
         except json.JSONDecodeError:
             return None, "Invalid JSON format in input"
 
-    # Validate 'workflow' in input
-    workflow = job_input.get("workflow")
-    if workflow is None:
-        return None, "Missing 'workflow' parameter"
+    validated_jobs = []
+    jobs_payload = job_input.get("jobs")
 
-    # Validate 'images' in input, if provided
-    images = job_input.get("images")
-    if images is not None:
-        if not isinstance(images, list) or not all(
-            "name" in image and "image" in image for image in images
-        ):
-            return (
-                None,
-                "'images' must be a list of objects with 'name' and 'image' keys",
+    if jobs_payload is not None:
+        if not isinstance(jobs_payload, list) or len(jobs_payload) == 0:
+            return None, "'jobs' must be a non-empty list of workflow definitions"
+
+        for idx, job_definition in enumerate(jobs_payload, start=1):
+            if not isinstance(job_definition, dict):
+                return None, f"'jobs[{idx}]' must be an object"
+
+            workflow = job_definition.get("workflow")
+            if workflow is None:
+                return None, f"'workflow' missing in jobs[{idx}]"
+
+            images, image_error = _validate_images_field(
+                job_definition.get("images"), f"jobs[{idx}]"
+            )
+            if image_error:
+                return None, image_error
+
+            job_label = (
+                job_definition.get("job_label")
+                or job_definition.get("label")
+                or job_definition.get("id")
+                or f"job-{idx}"
             )
 
-    # Return validated data and no error
-    return {"workflow": workflow, "images": images}, None
+            validated_jobs.append(
+                {
+                    "job_label": job_label,
+                    "workflow": workflow,
+                    "images": images,
+                }
+            )
+    else:
+        workflow = job_input.get("workflow")
+        if workflow is None:
+            return None, "Missing 'workflow' parameter"
+
+        images, image_error = _validate_images_field(
+            job_input.get("images"), "input"
+        )
+        if image_error:
+            return None, image_error
+
+        validated_jobs.append(
+            {
+                "job_label": job_input.get("job_label") or "job-1",
+                "workflow": workflow,
+                "images": images,
+            }
+        )
+
+    return (
+        {
+            "jobs": validated_jobs,
+            "zip_outputs": bool(job_input.get("zip_outputs", True)),
+            "zip_filename_prefix": job_input.get("zip_filename_prefix")
+            or job_input.get("zip_prefix"),
+        },
+        None,
+    )
 
 
 def check_server(url, retries=500, delay=50):
@@ -439,120 +504,216 @@ def get_history(prompt_id):
     return response.json()
 
 
-def get_image_data(filename, subfolder, image_type):
+def fetch_output_file(filename, subfolder, resource_type):
     """
-    Fetch image bytes from the ComfyUI /view endpoint.
+    Fetch binary data (image/video) from the ComfyUI /view endpoint.
 
     Args:
-        filename (str): The filename of the image.
-        subfolder (str): The subfolder where the image is stored.
-        image_type (str): The type of the image (e.g., 'output').
+        filename (str): Target filename produced by ComfyUI.
+        subfolder (str): Subfolder for the artifact.
+        resource_type (str): The type reported by ComfyUI (e.g., 'output', 'temp').
 
     Returns:
-        bytes: The raw image data, or None if an error occurs.
+        bytes: Raw file contents or None if retrieval fails.
     """
     print(
-        f"worker-comfyui - Fetching image data: type={image_type}, subfolder={subfolder}, filename={filename}"
+        f"worker-comfyui - Fetching artifact: type={resource_type}, subfolder={subfolder}, filename={filename}"
     )
-    data = {"filename": filename, "subfolder": subfolder, "type": image_type}
+    data = {"filename": filename, "subfolder": subfolder, "type": resource_type}
     url_values = urllib.parse.urlencode(data)
     try:
-        # Use requests for consistency and timeout
-        response = requests.get(f"http://{COMFY_HOST}/view?{url_values}", timeout=60)
+        response = requests.get(f"http://{COMFY_HOST}/view?{url_values}", timeout=120)
         response.raise_for_status()
-        print(f"worker-comfyui - Successfully fetched image data for {filename}")
+        print(f"worker-comfyui - Successfully fetched artifact for {filename}")
         return response.content
     except requests.Timeout:
-        print(f"worker-comfyui - Timeout fetching image data for {filename}")
+        print(f"worker-comfyui - Timeout fetching artifact for {filename}")
         return None
     except requests.RequestException as e:
-        print(f"worker-comfyui - Error fetching image data for {filename}: {e}")
+        print(f"worker-comfyui - Error fetching artifact for {filename}: {e}")
         return None
     except Exception as e:
         print(
-            f"worker-comfyui - Unexpected error fetching image data for {filename}: {e}"
+            f"worker-comfyui - Unexpected error fetching artifact for {filename}: {e}"
         )
         return None
 
 
-def handler(job):
+def create_zip_archive(binary_outputs, zip_prefix=None):
     """
-    Handles a job using ComfyUI via websockets for status and image retrieval.
+    Bundle collected artifacts into a single base64-encoded ZIP archive.
 
     Args:
-        job (dict): A dictionary containing job details and input parameters.
+        binary_outputs (list): List of dictionaries with keys job_label, filename, bytes.
+        zip_prefix (str): Optional prefix for the resulting zip filename.
 
     Returns:
-        dict: A dictionary containing either an error message or a success status with generated images.
+        dict | None: Dictionary describing the zip payload or None if no data.
     """
-    job_input = job["input"]
-    job_id = job["id"]
+    if not binary_outputs:
+        return None
 
-    # Make sure that the input is valid
-    validated_data, error_message = validate_input(job_input)
-    if error_message:
-        return {"error": error_message}
+    archive_name = (zip_prefix or "outputs").replace(" ", "_")
+    zip_filename = f"{archive_name}-{uuid.uuid4().hex[:8]}.zip"
 
-    # Extract validated data
-    workflow = validated_data["workflow"]
-    input_images = validated_data.get("images")
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        for entry in binary_outputs:
+            job_label = entry.get("job_label") or "job"
+            internal_path = os.path.join(job_label, entry["filename"])
+            zipf.writestr(internal_path, entry["bytes"])
 
-    # Make sure that the ComfyUI HTTP API is available before proceeding
-    if not check_server(
-        f"http://{COMFY_HOST}/",
-        COMFY_API_AVAILABLE_MAX_RETRIES,
-        COMFY_API_AVAILABLE_INTERVAL_MS,
-    ):
-        return {
-            "error": f"ComfyUI server ({COMFY_HOST}) not reachable after multiple retries."
-        }
+    encoded_zip = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return {"filename": zip_filename, "type": "base64", "data": encoded_zip}
 
-    # Upload input images if they exist
-    if input_images:
-        upload_result = upload_images(input_images)
-        if upload_result["status"] == "error":
-            # Return upload errors
-            return {
-                "error": "Failed to upload one or more input images",
-                "details": upload_result["details"],
-            }
 
+def execute_workflow_job(runpod_job_id, job_label, workflow, input_images):
+    """
+    Execute a single ComfyUI workflow for an individual batch and collect outputs.
+    """
+    print(f"worker-comfyui - Starting workflow job '{job_label}'")
     ws = None
     client_id = str(uuid.uuid4())
     prompt_id = None
     output_data = []
+    binary_outputs = []
     errors = []
 
+    def _record_binary_output(filename, media_kind, file_bytes):
+        binary_outputs.append(
+            {
+                "job_label": job_label,
+                "media_kind": media_kind,
+                "filename": filename,
+                "bytes": file_bytes,
+            }
+        )
+
+    def _store_media_payload(filename, media_kind, file_bytes):
+        file_extension = os.path.splitext(filename)[1]
+        if not file_extension:
+            file_extension = ".mp4" if media_kind == "video" else ".png"
+            filename = f"{filename}{file_extension}"
+
+        safe_filename = os.path.basename(filename)
+        _record_binary_output(safe_filename, media_kind, file_bytes)
+
+        if os.environ.get("BUCKET_ENDPOINT_URL"):
+            try:
+                temp_file_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        suffix=file_extension, delete=False
+                    ) as temp_file:
+                        temp_file.write(file_bytes)
+                        temp_file_path = temp_file.name
+                    print(
+                        f"worker-comfyui - Uploading {safe_filename} (job '{job_label}') to S3..."
+                    )
+                    s3_url = rp_upload.upload_image(runpod_job_id, temp_file_path)
+                    output_data.append(
+                        {
+                            "filename": safe_filename,
+                            "type": "s3_url",
+                            "media_kind": media_kind,
+                            "data": s3_url,
+                        }
+                    )
+                finally:
+                    if temp_file_path and os.path.exists(temp_file_path):
+                        try:
+                            os.remove(temp_file_path)
+                        except OSError as cleanup_err:
+                            print(
+                                f"worker-comfyui - Warning: could not remove temp file {temp_file_path}: {cleanup_err}"
+                            )
+            except Exception as upload_error:
+                error_msg = (
+                    f"Error uploading {safe_filename} for job '{job_label}' to S3: {upload_error}"
+                )
+                print(f"worker-comfyui - {error_msg}")
+                errors.append(error_msg)
+        else:
+            try:
+                base64_payload = base64.b64encode(file_bytes).decode("utf-8")
+                output_data.append(
+                    {
+                        "filename": safe_filename,
+                        "type": "base64",
+                        "media_kind": media_kind,
+                        "data": base64_payload,
+                    }
+                )
+                print(
+                    f"worker-comfyui - Encoded {safe_filename} for job '{job_label}' as base64"
+                )
+            except Exception as encode_error:
+                error_msg = (
+                    f"Error encoding {safe_filename} for job '{job_label}' to base64: {encode_error}"
+                )
+                print(f"worker-comfyui - {error_msg}")
+                errors.append(error_msg)
+
+    def _collect_media(node_id, node_output, node_output_key, media_kind):
+        media_entries = node_output.get(node_output_key, [])
+        if not media_entries:
+            return
+        print(
+            f"worker-comfyui - Node {node_id} contains {len(media_entries)} {media_kind}(s) for job '{job_label}'"
+        )
+        for media_info in media_entries:
+            filename = media_info.get("filename")
+            subfolder = media_info.get("subfolder", "")
+            resource_type = media_info.get("type")
+
+            if media_kind == "image" and resource_type == "temp":
+                print(
+                    f"worker-comfyui - Skipping temp image {filename} for job '{job_label}'"
+                )
+                continue
+
+            if not filename:
+                warn_msg = f"Skipping {media_kind} in node {node_id} due to missing filename"
+                print(f"worker-comfyui - {warn_msg}")
+                errors.append(warn_msg)
+                continue
+
+            file_bytes = fetch_output_file(filename, subfolder, resource_type)
+            if file_bytes is None:
+                errors.append(
+                    f"Failed to fetch {media_kind} data for {filename} from /view endpoint."
+                )
+                continue
+
+            _store_media_payload(filename, media_kind, file_bytes)
+
     try:
-        # Establish WebSocket connection
         ws_url = f"ws://{COMFY_HOST}/ws?clientId={client_id}"
-        print(f"worker-comfyui - Connecting to websocket: {ws_url}")
+        print(f"worker-comfyui - Connecting to websocket for job '{job_label}': {ws_url}")
         ws = websocket.WebSocket()
         ws.connect(ws_url, timeout=10)
-        print(f"worker-comfyui - Websocket connected")
+        print(f"worker-comfyui - Websocket connected for job '{job_label}'")
 
-        # Queue the workflow
-        try:
-            queued_workflow = queue_workflow(workflow, client_id)
-            prompt_id = queued_workflow.get("prompt_id")
-            if not prompt_id:
+        if input_images:
+            upload_result = upload_images(input_images)
+            if upload_result["status"] == "error":
                 raise ValueError(
-                    f"Missing 'prompt_id' in queue response: {queued_workflow}"
+                    f"Job '{job_label}' failed to upload one or more input images: {upload_result['details']}"
                 )
-            print(f"worker-comfyui - Queued workflow with ID: {prompt_id}")
-        except requests.RequestException as e:
-            print(f"worker-comfyui - Error queuing workflow: {e}")
-            raise ValueError(f"Error queuing workflow: {e}")
-        except Exception as e:
-            print(f"worker-comfyui - Unexpected error queuing workflow: {e}")
-            # For ValueError exceptions from queue_workflow, pass through the original message
-            if isinstance(e, ValueError):
-                raise e
-            else:
-                raise ValueError(f"Unexpected error queuing workflow: {e}")
 
-        # Wait for execution completion via WebSocket
-        print(f"worker-comfyui - Waiting for workflow execution ({prompt_id})...")
+        queued_workflow = queue_workflow(workflow, client_id)
+        prompt_id = queued_workflow.get("prompt_id")
+        if not prompt_id:
+            raise ValueError(
+                f"Job '{job_label}': Missing 'prompt_id' in queue response: {queued_workflow}"
+            )
+        print(
+            f"worker-comfyui - Queued workflow with ID {prompt_id} for job '{job_label}'"
+        )
+
+        print(
+            f"worker-comfyui - Waiting for workflow execution ({prompt_id}) for job '{job_label}'..."
+        )
         execution_done = False
         while True:
             try:
@@ -562,7 +723,7 @@ def handler(job):
                     if message.get("type") == "status":
                         status_data = message.get("data", {}).get("status", {})
                         print(
-                            f"worker-comfyui - Status update: {status_data.get('exec_info', {}).get('queue_remaining', 'N/A')} items remaining in queue"
+                            f"worker-comfyui - Job '{job_label}' status update: {status_data.get('exec_info', {}).get('queue_remaining', 'N/A')} items remaining in queue"
                         )
                     elif message.get("type") == "executing":
                         data = message.get("data", {})
@@ -571,7 +732,7 @@ def handler(job):
                             and data.get("prompt_id") == prompt_id
                         ):
                             print(
-                                f"worker-comfyui - Execution finished for prompt {prompt_id}"
+                                f"worker-comfyui - Execution finished for prompt {prompt_id} (job '{job_label}')"
                             )
                             execution_done = True
                             break
@@ -580,215 +741,174 @@ def handler(job):
                         if data.get("prompt_id") == prompt_id:
                             error_details = f"Node Type: {data.get('node_type')}, Node ID: {data.get('node_id')}, Message: {data.get('exception_message')}"
                             print(
-                                f"worker-comfyui - Execution error received: {error_details}"
+                                f"worker-comfyui - Execution error for job '{job_label}': {error_details}"
                             )
                             errors.append(f"Workflow execution error: {error_details}")
                             break
                 else:
                     continue
             except websocket.WebSocketTimeoutException:
-                print(f"worker-comfyui - Websocket receive timed out. Still waiting...")
+                print(
+                    f"worker-comfyui - Websocket receive timed out for job '{job_label}'. Still waiting..."
+                )
                 continue
             except websocket.WebSocketConnectionClosedException as closed_err:
                 try:
-                    # Attempt to reconnect
                     ws = _attempt_websocket_reconnect(
                         ws_url,
                         WEBSOCKET_RECONNECT_ATTEMPTS,
                         WEBSOCKET_RECONNECT_DELAY_S,
                         closed_err,
                     )
-
                     print(
-                        "worker-comfyui - Resuming message listening after successful reconnect."
+                        f"worker-comfyui - Resumed websocket after reconnect for job '{job_label}'"
                     )
                     continue
-                except (
-                    websocket.WebSocketConnectionClosedException
-                ) as reconn_failed_err:
-                    # If _attempt_websocket_reconnect fails, it raises this exception
-                    # Let this exception propagate to the outer handler's except block
-                    raise reconn_failed_err
-
+                except websocket.WebSocketConnectionClosedException as reconn_failed:
+                    raise reconn_failed
             except json.JSONDecodeError:
-                print(f"worker-comfyui - Received invalid JSON message via websocket.")
+                print(
+                    f"worker-comfyui - Job '{job_label}' received invalid JSON message via websocket."
+                )
 
         if not execution_done and not errors:
             raise ValueError(
-                "Workflow monitoring loop exited without confirmation of completion or error."
+                f"Job '{job_label}': Workflow monitoring loop exited without completion or error."
             )
 
-        # Fetch history even if there were execution errors, some outputs might exist
-        print(f"worker-comfyui - Fetching history for prompt {prompt_id}...")
+        print(f"worker-comfyui - Fetching history for prompt {prompt_id} (job '{job_label}')...")
         history = get_history(prompt_id)
 
         if prompt_id not in history:
-            error_msg = f"Prompt ID {prompt_id} not found in history after execution."
-            print(f"worker-comfyui - {error_msg}")
-            if not errors:
-                return {"error": error_msg}
-            else:
-                errors.append(error_msg)
-                return {
-                    "error": "Job processing failed, prompt ID not found in history.",
-                    "details": errors,
-                }
+            raise ValueError(
+                f"Job '{job_label}': Prompt ID {prompt_id} not found in history after execution."
+            )
 
         prompt_history = history.get(prompt_id, {})
         outputs = prompt_history.get("outputs", {})
 
         if not outputs:
-            warning_msg = f"No outputs found in history for prompt {prompt_id}."
+            warning_msg = (
+                f"Job '{job_label}': No outputs found in history for prompt {prompt_id}."
+            )
             print(f"worker-comfyui - {warning_msg}")
-            if not errors:
-                errors.append(warning_msg)
+            errors.append(warning_msg)
 
-        print(f"worker-comfyui - Processing {len(outputs)} output nodes...")
+        print(
+            f"worker-comfyui - Processing {len(outputs)} output nodes for job '{job_label}'..."
+        )
         for node_id, node_output in outputs.items():
-            if "images" in node_output:
-                print(
-                    f"worker-comfyui - Node {node_id} contains {len(node_output['images'])} image(s)"
-                )
-                for image_info in node_output["images"]:
-                    filename = image_info.get("filename")
-                    subfolder = image_info.get("subfolder", "")
-                    img_type = image_info.get("type")
+            _collect_media(node_id, node_output, "images", "image")
+            _collect_media(node_id, node_output, "videos", "video")
 
-                    # skip temp images
-                    if img_type == "temp":
-                        print(
-                            f"worker-comfyui - Skipping image {filename} because type is 'temp'"
-                        )
-                        continue
-
-                    if not filename:
-                        warn_msg = f"Skipping image in node {node_id} due to missing filename: {image_info}"
-                        print(f"worker-comfyui - {warn_msg}")
-                        errors.append(warn_msg)
-                        continue
-
-                    image_bytes = get_image_data(filename, subfolder, img_type)
-
-                    if image_bytes:
-                        file_extension = os.path.splitext(filename)[1] or ".png"
-
-                        if os.environ.get("BUCKET_ENDPOINT_URL"):
-                            try:
-                                with tempfile.NamedTemporaryFile(
-                                    suffix=file_extension, delete=False
-                                ) as temp_file:
-                                    temp_file.write(image_bytes)
-                                    temp_file_path = temp_file.name
-                                print(
-                                    f"worker-comfyui - Wrote image bytes to temporary file: {temp_file_path}"
-                                )
-
-                                print(f"worker-comfyui - Uploading {filename} to S3...")
-                                s3_url = rp_upload.upload_image(job_id, temp_file_path)
-                                os.remove(temp_file_path)  # Clean up temp file
-                                print(
-                                    f"worker-comfyui - Uploaded {filename} to S3: {s3_url}"
-                                )
-                                # Append dictionary with filename and URL
-                                output_data.append(
-                                    {
-                                        "filename": filename,
-                                        "type": "s3_url",
-                                        "data": s3_url,
-                                    }
-                                )
-                            except Exception as e:
-                                error_msg = f"Error uploading {filename} to S3: {e}"
-                                print(f"worker-comfyui - {error_msg}")
-                                errors.append(error_msg)
-                                if "temp_file_path" in locals() and os.path.exists(
-                                    temp_file_path
-                                ):
-                                    try:
-                                        os.remove(temp_file_path)
-                                    except OSError as rm_err:
-                                        print(
-                                            f"worker-comfyui - Error removing temp file {temp_file_path}: {rm_err}"
-                                        )
-                        else:
-                            # Return as base64 string
-                            try:
-                                base64_image = base64.b64encode(image_bytes).decode(
-                                    "utf-8"
-                                )
-                                # Append dictionary with filename and base64 data
-                                output_data.append(
-                                    {
-                                        "filename": filename,
-                                        "type": "base64",
-                                        "data": base64_image,
-                                    }
-                                )
-                                print(f"worker-comfyui - Encoded {filename} as base64")
-                            except Exception as e:
-                                error_msg = f"Error encoding {filename} to base64: {e}"
-                                print(f"worker-comfyui - {error_msg}")
-                                errors.append(error_msg)
-                    else:
-                        error_msg = f"Failed to fetch image data for {filename} from /view endpoint."
-                        errors.append(error_msg)
-
-            # Check for other output types
-            other_keys = [k for k in node_output.keys() if k != "images"]
+            other_keys = [
+                k for k in node_output.keys() if k not in ("images", "videos")
+            ]
             if other_keys:
                 warn_msg = (
-                    f"Node {node_id} produced unhandled output keys: {other_keys}."
+                    f"Node {node_id} produced unhandled output keys: {other_keys} for job '{job_label}'."
                 )
                 print(f"worker-comfyui - WARNING: {warn_msg}")
-                print(
-                    f"worker-comfyui - --> If this output is useful, please consider opening an issue on GitHub to discuss adding support."
-                )
+                errors.append(warn_msg)
 
     except websocket.WebSocketException as e:
-        print(f"worker-comfyui - WebSocket Error: {e}")
+        print(f"worker-comfyui - WebSocket Error in job '{job_label}': {e}")
         print(traceback.format_exc())
-        return {"error": f"WebSocket communication error: {e}"}
+        errors.append(f"WebSocket communication error: {e}")
     except requests.RequestException as e:
-        print(f"worker-comfyui - HTTP Request Error: {e}")
+        print(f"worker-comfyui - HTTP Request Error in job '{job_label}': {e}")
         print(traceback.format_exc())
-        return {"error": f"HTTP communication error with ComfyUI: {e}"}
+        errors.append(f"HTTP communication error with ComfyUI: {e}")
     except ValueError as e:
-        print(f"worker-comfyui - Value Error: {e}")
+        print(f"worker-comfyui - Value Error in job '{job_label}': {e}")
         print(traceback.format_exc())
-        return {"error": str(e)}
+        errors.append(str(e))
     except Exception as e:
-        print(f"worker-comfyui - Unexpected Handler Error: {e}")
+        print(f"worker-comfyui - Unexpected Error in job '{job_label}': {e}")
         print(traceback.format_exc())
-        return {"error": f"An unexpected error occurred: {e}"}
+        errors.append(f"An unexpected error occurred: {e}")
     finally:
         if ws and ws.connected:
-            print(f"worker-comfyui - Closing websocket connection.")
+            print(f"worker-comfyui - Closing websocket connection for job '{job_label}'.")
             ws.close()
 
-    final_result = {}
+    job_result = {"job_label": job_label, "media": output_data}
 
-    if output_data:
-        final_result["images"] = output_data
+    if errors and not output_data:
+        job_result["status"] = "error"
+        job_result["errors"] = errors
+    elif errors:
+        job_result["status"] = "completed_with_warnings"
+        job_result["errors"] = errors
+    else:
+        job_result["status"] = "success"
 
-    if errors:
-        final_result["errors"] = errors
-        print(f"worker-comfyui - Job completed with errors/warnings: {errors}")
+    print(
+        f"worker-comfyui - Job '{job_label}' completed with {len(output_data)} artifact(s)."
+    )
+    return {"result": job_result, "binary_outputs": binary_outputs}
 
-    if not output_data and errors:
-        print(f"worker-comfyui - Job failed with no output images.")
+
+def handler(job):
+    """
+    Handles a job using ComfyUI via websockets for status and media retrieval.
+
+    Args:
+        job (dict): A dictionary containing job details and input parameters.
+
+    Returns:
+        dict: Aggregated results for every batch, plus an optional ZIP artifact.
+    """
+    job_input = job["input"]
+    job_id = job["id"]
+
+    validated_data, error_message = validate_input(job_input)
+    if error_message:
+        return {"error": error_message}
+
+    if not check_server(
+        f"http://{COMFY_HOST}/",
+        COMFY_API_AVAILABLE_MAX_RETRIES,
+        COMFY_API_AVAILABLE_INTERVAL_MS,
+    ):
         return {
-            "error": "Job processing failed",
-            "details": errors,
+            "error": f"ComfyUI server ({COMFY_HOST}) not reachable after multiple retries."
         }
-    elif not output_data and not errors:
-        print(
-            f"worker-comfyui - Job completed successfully, but the workflow produced no images."
-        )
-        final_result["status"] = "success_no_images"
-        final_result["images"] = []
 
-    print(f"worker-comfyui - Job completed. Returning {len(output_data)} image(s).")
-    return final_result
+    combined_results = []
+    binary_outputs = []
+    any_success = False
+
+    for job_payload in validated_data["jobs"]:
+        job_label = job_payload["job_label"]
+        workflow = job_payload["workflow"]
+        images = job_payload.get("images") or []
+
+        execution = execute_workflow_job(job_id, job_label, workflow, images)
+        combined_results.append(execution["result"])
+        binary_outputs.extend(execution["binary_outputs"])
+
+        if execution["result"].get("status") in ("success", "completed_with_warnings"):
+            any_success = True
+
+    final_response = {"jobs": combined_results}
+
+    if validated_data.get("zip_outputs", True):
+        video_binary_outputs = [
+            entry for entry in binary_outputs if entry.get("media_kind") == "video"
+        ]
+        zip_entry = create_zip_archive(
+            video_binary_outputs, validated_data.get("zip_filename_prefix") or job_id
+        )
+        if zip_entry:
+            final_response["zip_file"] = zip_entry
+
+    if not any_success:
+        final_response["error"] = (
+            "All batch jobs failed. Check individual job errors for details."
+        )
+
+    return final_response
 
 
 if __name__ == "__main__":
