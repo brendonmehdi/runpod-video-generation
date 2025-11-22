@@ -14,6 +14,9 @@ import tempfile
 import socket
 import traceback
 import zipfile
+from pathlib import Path
+import copy
+import shutil
 
 # Time to wait between API check attempts in milliseconds
 COMFY_API_AVAILABLE_INTERVAL_MS = 50
@@ -39,6 +42,17 @@ COMFY_HOST = "127.0.0.1:8188"
 # Enforce a clean state after each job is done
 # see https://docs.runpod.io/docs/handler-additional-controls#refresh-worker
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
+# Workflow/mode configuration
+# ---------------------------------------------------------------------------
+MODE_IMG2VIDEO = "img2video"
+MODE_REF_VIDEO = "ref_video_lora"
+DEFAULT_LORA_NAME = None  # Optional; only apply when caller supplies a LORA.
+WORKFLOWS_DIR = Path(__file__).parent / "test_resources" / "workflows"
+REF_VIDEO_WORKFLOW_PATH = WORKFLOWS_DIR / "wholebodyReplacer.json"
+# Where ComfyUI reads uploaded assets; defaults to standard ComfyUI input dir.
+COMFY_INPUT_DIR = Path(os.environ.get("COMFY_INPUT_DIR", "/workspace/ComfyUI/input"))
 
 # ---------------------------------------------------------------------------
 # Helper: quick reachability probe of ComfyUI HTTP endpoint (port 8188)
@@ -171,30 +185,25 @@ def validate_input(job_input):
 
     validated_jobs = []
     jobs_payload = job_input.get("jobs")
+    global_mode = job_input.get("mode")
 
-    if jobs_payload is not None:
-        if not isinstance(jobs_payload, list) or len(jobs_payload) == 0:
-            return None, "'jobs' must be a non-empty list of workflow definitions"
+    def _append_job_from_definition(job_definition, job_index_label):
+        if not isinstance(job_definition, dict):
+            return f"'{job_index_label}' must be an object"
 
-        for idx, job_definition in enumerate(jobs_payload, start=1):
-            if not isinstance(job_definition, dict):
-                return None, f"'jobs[{idx}]' must be an object"
-
-            workflow = job_definition.get("workflow")
-            if workflow is None:
-                return None, f"'workflow' missing in jobs[{idx}]"
-
+        workflow = job_definition.get("workflow")
+        if workflow is not None:
             images, image_error = _validate_images_field(
-                job_definition.get("images"), f"jobs[{idx}]"
+                job_definition.get("images"), job_index_label
             )
             if image_error:
-                return None, image_error
+                return image_error
 
             job_label = (
                 job_definition.get("job_label")
                 or job_definition.get("label")
                 or job_definition.get("id")
-                or f"job-{idx}"
+                or job_index_label
             )
 
             validated_jobs.append(
@@ -202,26 +211,71 @@ def validate_input(job_input):
                     "job_label": job_label,
                     "workflow": workflow,
                     "images": images,
+                    "mode": job_definition.get("mode") or global_mode,
                 }
             )
+            return None
+
+        # New: build workflows based on declared mode.
+        mode = (job_definition.get("mode") or global_mode or "").strip().lower()
+        if not mode:
+            return f"Missing 'workflow' or 'mode' in {job_index_label}"
+
+        if mode not in (MODE_IMG2VIDEO, MODE_REF_VIDEO):
+            return f"Unsupported mode '{mode}' in {job_index_label}"
+
+        if mode == MODE_REF_VIDEO:
+            if "character_image" not in job_definition:
+                return f"'character_image' is required in {job_index_label} for mode '{MODE_REF_VIDEO}'"
+            if "reference_video" not in job_definition:
+                return f"'reference_video' is required in {job_index_label} for mode '{MODE_REF_VIDEO}'"
+            prompt = job_definition.get("prompt")
+            if prompt is None:
+                return f"'prompt' is required in {job_index_label} for mode '{MODE_REF_VIDEO}'"
+
+            job_label = (
+                job_definition.get("job_label")
+                or job_definition.get("label")
+                or job_definition.get("id")
+                or job_index_label
+            )
+
+            validated_jobs.append(
+                {
+                    "job_label": job_label,
+                    "mode": MODE_REF_VIDEO,
+                    "prompt": prompt,
+                    "neg_prompt": job_definition.get("neg_prompt"),
+                    "character_image": job_definition.get("character_image"),
+                    "character_image_name": job_definition.get("character_image_name"),
+                    "reference_video": job_definition.get("reference_video"),
+                    "reference_video_name": job_definition.get("reference_video_name"),
+                    "lora_name": job_definition.get("lora_name"),
+                    "use_face_crop": bool(job_definition.get("use_face_crop", False)),
+                    "width": job_definition.get("width"),
+                    "height": job_definition.get("height"),
+                    "video_length": job_definition.get("video_length"),
+                }
+            )
+            return None
+
+        return (
+            f"{job_index_label} in mode '{MODE_IMG2VIDEO}' must include a 'workflow' "
+            "payload to preserve legacy behaviour."
+        )
+
+    if jobs_payload is not None:
+        if not isinstance(jobs_payload, list) or len(jobs_payload) == 0:
+            return None, "'jobs' must be a non-empty list of workflow definitions"
+
+        for idx, job_definition in enumerate(jobs_payload, start=1):
+            err = _append_job_from_definition(job_definition, f"jobs[{idx}]")
+            if err:
+                return None, err
     else:
-        workflow = job_input.get("workflow")
-        if workflow is None:
-            return None, "Missing 'workflow' parameter"
-
-        images, image_error = _validate_images_field(
-            job_input.get("images"), "input"
-        )
-        if image_error:
-            return None, image_error
-
-        validated_jobs.append(
-            {
-                "job_label": job_input.get("job_label") or "job-1",
-                "workflow": workflow,
-                "images": images,
-            }
-        )
+        err = _append_job_from_definition(job_input, "job-1")
+        if err:
+            return None, err
 
     return (
         {
@@ -229,9 +283,214 @@ def validate_input(job_input):
             "zip_outputs": bool(job_input.get("zip_outputs", True)),
             "zip_filename_prefix": job_input.get("zip_filename_prefix")
             or job_input.get("zip_prefix"),
+            "mode": job_input.get("mode"),
         },
         None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Workflow assembly helpers for the new reference-video mode
+# ---------------------------------------------------------------------------
+
+
+def _decode_data_uri(data_uri):
+    """Decode a base64 data URI or plain base64 string into bytes."""
+    if not isinstance(data_uri, str):
+        raise ValueError("Expected base64 string for media payload.")
+    if "," in data_uri:
+        _, encoded = data_uri.split(",", 1)
+    else:
+        encoded = data_uri
+    return base64.b64decode(encoded)
+
+
+def _persist_input_file(data_uri_or_path, preferred_name, kind):
+    """
+    Persist an incoming base64 (or existing path) to the ComfyUI input directory.
+    Returns the filename (not the full path) that the workflow should reference.
+    """
+    COMFY_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(data_uri_or_path, str) and os.path.isfile(data_uri_or_path):
+        file_path = Path(data_uri_or_path)
+        target_name = preferred_name or file_path.name
+        target_path = COMFY_INPUT_DIR / target_name
+        shutil.copy(file_path, target_path)
+        return target_name
+
+    # Assume base64 content
+    extension = "png" if kind == "image" else "mp4"
+    filename = preferred_name or f"{kind}-{uuid.uuid4().hex}.{extension}"
+    try:
+        blob = _decode_data_uri(data_uri_or_path)
+    except Exception as exc:
+        raise ValueError(f"Failed to decode {kind} payload: {exc}") from exc
+
+    target_path = COMFY_INPUT_DIR / filename
+    with open(target_path, "wb") as fh:
+        fh.write(blob)
+    return filename
+
+
+def _load_workflow_template(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Workflow template not found at {path}. "
+            "Place wholebodyReplacer.json there or update REF_VIDEO_WORKFLOW_PATH."
+        )
+    with path.open("r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _get_node_by_id(nodes, node_id):
+    for node in nodes:
+        if node.get("id") == node_id:
+            return node
+    return None
+
+
+def _get_widget_value(nodes, node_id, index=0, key=None, fallback=None):
+    node = _get_node_by_id(nodes, node_id)
+    if not node:
+        return fallback
+    widgets = node.get("widgets_values")
+    if isinstance(widgets, dict):
+        return widgets.get(key, fallback)
+    if isinstance(widgets, list):
+        try:
+            return widgets[index]
+        except IndexError:
+            return fallback
+    return fallback
+
+
+def _set_widget_value(nodes, node_id, value, index=0, key=None):
+    node = _get_node_by_id(nodes, node_id)
+    if not node:
+        raise ValueError(f"Node {node_id} not found in workflow.")
+    widgets = node.get("widgets_values")
+    if isinstance(widgets, dict):
+        if key is None:
+            raise ValueError(f"Node {node_id} expects dict widget, provide key.")
+        widgets[key] = value
+    elif isinstance(widgets, list):
+        while len(widgets) <= index:
+            widgets.append(None)
+        widgets[index] = value
+    else:
+        node["widgets_values"] = [value]
+
+
+def _toggle_face_crop(workflow_dict, use_face_crop):
+    """
+    When face crop is disabled, rewire Set_reference_image (node 378) to use the
+    original uploaded image (node 311) instead of the ImageCropByMaskAndResize (432).
+    """
+    if use_face_crop:
+        return  # leave as-is
+
+    nodes = workflow_dict.get("nodes", [])
+    links = workflow_dict.get("links", [])
+    last_link_id = workflow_dict.get("last_link_id", 0)
+
+    set_ref_node = _get_node_by_id(nodes, 378)
+    source_node = _get_node_by_id(nodes, 311)
+    crop_node = _get_node_by_id(nodes, 432)
+
+    if not set_ref_node or not source_node:
+        return
+
+    # Remove old link from crop node to set node if present
+    old_link_id = None
+    if set_ref_node.get("inputs"):
+        old_link_id = set_ref_node["inputs"][0].get("link")
+    if crop_node and crop_node.get("outputs"):
+        for output in crop_node["outputs"]:
+            if output.get("links") and old_link_id in output["links"]:
+                output["links"] = [l for l in output["links"] if l != old_link_id]
+
+    new_link_id = last_link_id + 1
+    # Update target input
+    if set_ref_node.get("inputs"):
+        set_ref_node["inputs"][0]["link"] = new_link_id
+    # Update source output links
+    if source_node.get("outputs"):
+        source_node["outputs"][0]["links"] = list(
+            set(source_node["outputs"][0].get("links", []) + [new_link_id])
+        )
+    # Add new link entry
+    links.append([new_link_id, 311, 0, 378, 0, "IMAGE"])
+    workflow_dict["last_link_id"] = new_link_id
+
+
+def build_ref_video_workflow(job_payload):
+    """
+    Build a workflow for the reference-video mode by patching the provided template.
+    """
+    template = _load_workflow_template(REF_VIDEO_WORKFLOW_PATH)
+    workflow = copy.deepcopy(template)
+    nodes = workflow.get("nodes", [])
+
+    print(
+        f"worker-comfyui - Building reference-video workflow from {REF_VIDEO_WORKFLOW_PATH}"
+    )
+
+    # Persist assets so ComfyUI can read them from disk.
+    character_image_name = _persist_input_file(
+        job_payload["character_image"],
+        job_payload.get("character_image_name"),
+        "image",
+    )
+    reference_video_name = _persist_input_file(
+        job_payload["reference_video"],
+        job_payload.get("reference_video_name"),
+        "video",
+    )
+    print(
+        f"worker-comfyui - Stored inputs for job '{job_payload.get('job_label')}' "
+        f"(image={character_image_name}, video={reference_video_name})"
+    )
+
+    # Defaults pulled from the template in case caller omits numerics.
+    width = job_payload.get("width") or _get_widget_value(nodes, 330, 0, fallback=720)
+    height = job_payload.get("height") or _get_widget_value(nodes, 331, 0, fallback=1280)
+    video_length = job_payload.get("video_length") or _get_widget_value(
+        nodes, 383, 0, fallback=254
+    )
+
+    # Patch primary inputs.
+    _set_widget_value(nodes, 311, character_image_name, index=0)  # LoadImage
+    _set_widget_value(
+        nodes, 417, reference_video_name, key="video"
+    )  # VHS_LoadVideo expects filename
+    _set_widget_value(nodes, 330, int(width), index=0)  # Video Width
+    _set_widget_value(nodes, 331, int(height), index=0)  # Video Height
+    _set_widget_value(nodes, 383, int(video_length), index=0)  # Video Length (frames)
+
+    prompt = job_payload.get("prompt")
+    neg_prompt = job_payload.get("neg_prompt")
+    if prompt is not None:
+        _set_widget_value(nodes, 227, prompt, index=0)  # Positive Prompt
+    if neg_prompt is not None:
+        _set_widget_value(nodes, 228, neg_prompt, index=0)  # Negative Prompt
+
+    lora_name = job_payload.get("lora_name") or DEFAULT_LORA_NAME
+    if lora_name:
+        _set_widget_value(nodes, 464, lora_name, index=0)  # filename
+        _set_widget_value(nodes, 464, 1, index=1)  # strength, keep default if present
+    else:
+        # Clear LORA filename and set strength to 0 so the node becomes a no-op when caller does not provide one.
+        _set_widget_value(nodes, 464, "", index=0)
+        _set_widget_value(nodes, 464, 0, index=1)
+
+    _toggle_face_crop(workflow, job_payload.get("use_face_crop", False))
+
+    print(
+        f"worker-comfyui - Workflow patched for job '{job_payload.get('job_label')}' "
+        f"(mode={MODE_REF_VIDEO}, face_crop={job_payload.get('use_face_crop', False)}, lora={lora_name})"
+    )
+    return workflow
 
 
 def check_server(url, retries=500, delay=50):
@@ -881,8 +1140,25 @@ def handler(job):
 
     for job_payload in validated_data["jobs"]:
         job_label = job_payload["job_label"]
-        workflow = job_payload["workflow"]
-        images = job_payload.get("images") or []
+        mode = (job_payload.get("mode") or validated_data.get("mode") or "").strip().lower()
+
+        try:
+            if job_payload.get("workflow") is not None:
+                workflow = job_payload["workflow"]
+                images = job_payload.get("images") or []
+            elif mode == MODE_REF_VIDEO:
+                workflow = build_ref_video_workflow(job_payload)
+                images = []  # assets persisted to disk for this mode
+            else:
+                raise ValueError(
+                    f"Job '{job_label}': unsupported or missing workflow/mode. "
+                    "Provide 'workflow' or mode 'ref_video_lora'."
+                )
+        except Exception as build_err:
+            combined_results.append(
+                {"job_label": job_label, "status": "error", "errors": [str(build_err)]}
+            )
+            continue
 
         execution = execute_workflow_job(job_id, job_label, workflow, images)
         combined_results.append(execution["result"])
