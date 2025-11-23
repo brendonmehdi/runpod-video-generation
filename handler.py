@@ -14,6 +14,10 @@ import tempfile
 import socket
 import traceback
 import zipfile
+import copy
+
+# Path to the Whole Body Replacer workflow
+WHOLEBODY_WORKFLOW_PATH = "test_resources/workflows/wholebodyReplacer.json"
 
 # Time to wait between API check attempts in milliseconds
 COMFY_API_AVAILABLE_INTERVAL_MS = 50
@@ -181,7 +185,8 @@ def validate_input(job_input):
                 return None, f"'jobs[{idx}]' must be an object"
 
             workflow = job_definition.get("workflow")
-            if workflow is None:
+            mode = job_definition.get("mode")
+            if workflow is None and mode != "ref_video_lora":
                 return None, f"'workflow' missing in jobs[{idx}]"
 
             images, image_error = _validate_images_field(
@@ -198,15 +203,29 @@ def validate_input(job_input):
             )
 
             validated_jobs.append(
-                {
                     "job_label": job_label,
                     "workflow": workflow,
                     "images": images,
+                    # Pass through new fields for wholebody workflow
+                    "mode": job_definition.get("mode"),
+                    "prompt": job_definition.get("prompt"),
+                    "neg_prompt": job_definition.get("neg_prompt"),
+                    "character_image": job_definition.get("character_image"),
+                    "character_image_name": job_definition.get("character_image_name"),
+                    "reference_video": job_definition.get("reference_video"),
+                    "reference_video_name": job_definition.get("reference_video_name"),
+                    "lora_name": job_definition.get("lora_name"),
+                    "use_face_crop": job_definition.get("use_face_crop"),
+                    "width": job_definition.get("width"),
+                    "height": job_definition.get("height"),
+                    "video_length": job_definition.get("video_length"),
                 }
             )
     else:
         workflow = job_input.get("workflow")
-        if workflow is None:
+        mode = job_input.get("mode")
+        
+        if workflow is None and mode != "ref_video_lora":
             return None, "Missing 'workflow' parameter"
 
         images, image_error = _validate_images_field(
@@ -220,6 +239,19 @@ def validate_input(job_input):
                 "job_label": job_input.get("job_label") or "job-1",
                 "workflow": workflow,
                 "images": images,
+                # Pass through new fields for wholebody workflow
+                "mode": job_input.get("mode"),
+                "prompt": job_input.get("prompt"),
+                "neg_prompt": job_input.get("neg_prompt"),
+                "character_image": job_input.get("character_image"),
+                "character_image_name": job_input.get("character_image_name"),
+                "reference_video": job_input.get("reference_video"),
+                "reference_video_name": job_input.get("reference_video_name"),
+                "lora_name": job_input.get("lora_name"),
+                "use_face_crop": job_input.get("use_face_crop"),
+                "width": job_input.get("width"),
+                "height": job_input.get("height"),
+                "video_length": job_input.get("video_length"),
             }
         )
 
@@ -270,88 +302,92 @@ def check_server(url, retries=500, delay=50):
     return False
 
 
-def upload_images(images):
+def upload_media(media_items):
     """
-    Upload a list of base64 encoded images to the ComfyUI server using the /upload/image endpoint.
+    Upload a list of base64 encoded media (images/videos) to the ComfyUI server.
 
     Args:
-        images (list): A list of dictionaries, each containing the 'name' of the image and the 'image' as a base64 encoded string.
+        media_items (list): A list of dictionaries, each containing:
+            - 'name': filename
+            - 'image' or 'video': base64 encoded string
+            - 'type': (optional) 'image' or 'video', defaults to image logic
 
     Returns:
         dict: A dictionary indicating success or error.
     """
-    if not images:
-        return {"status": "success", "message": "No images to upload", "details": []}
+    if not media_items:
+        return {"status": "success", "message": "No media to upload", "details": []}
 
     responses = []
     upload_errors = []
 
-    print(f"worker-comfyui - Uploading {len(images)} image(s)...")
+    print(f"worker-comfyui - Uploading {len(media_items)} media item(s)...")
 
-    for image in images:
+    for item in media_items:
         try:
-            name = image["name"]
-            image_data_uri = image["image"]  # Get the full string (might have prefix)
+            name = item.get("name")
+            # Support both 'image' and 'video' keys, or generic 'data'
+            data_uri = item.get("image") or item.get("video") or item.get("data")
+            
+            if not data_uri:
+                continue
 
             # --- Strip Data URI prefix if present ---
-            if "," in image_data_uri:
-                # Find the comma and take everything after it
-                base64_data = image_data_uri.split(",", 1)[1]
+            if "," in data_uri:
+                base64_data = data_uri.split(",", 1)[1]
             else:
-                # Assume it's already pure base64
-                base64_data = image_data_uri
+                base64_data = data_uri
             # --- End strip ---
 
-            blob = base64.b64decode(base64_data)  # Decode the cleaned data
+            blob = base64.b64decode(base64_data)
+            
+            # Determine mime type based on extension or default
+            ext = os.path.splitext(name)[1].lower()
+            if ext in ['.mp4', '.webm', '.mov', '.avi']:
+                content_type = "video/mp4" # ComfyUI handles most video uploads via same endpoint
+                upload_type = "video"
+            else:
+                content_type = "image/png"
+                upload_type = "image"
 
             # Prepare the form data
             files = {
-                "image": (name, BytesIO(blob), "image/png"),
+                "image": (name, BytesIO(blob), content_type),
                 "overwrite": (None, "true"),
             }
 
-            # POST request to upload the image
+            # POST request to upload
+            # ComfyUI uses /upload/image for both images and videos usually
             response = requests.post(
-                f"http://{COMFY_HOST}/upload/image", files=files, timeout=30
+                f"http://{COMFY_HOST}/upload/image", files=files, timeout=60
             )
             response.raise_for_status()
 
             responses.append(f"Successfully uploaded {name}")
             print(f"worker-comfyui - Successfully uploaded {name}")
 
-        except base64.binascii.Error as e:
-            error_msg = f"Error decoding base64 for {image.get('name', 'unknown')}: {e}"
-            print(f"worker-comfyui - {error_msg}")
-            upload_errors.append(error_msg)
-        except requests.Timeout:
-            error_msg = f"Timeout uploading {image.get('name', 'unknown')}"
-            print(f"worker-comfyui - {error_msg}")
-            upload_errors.append(error_msg)
-        except requests.RequestException as e:
-            error_msg = f"Error uploading {image.get('name', 'unknown')}: {e}"
-            print(f"worker-comfyui - {error_msg}")
-            upload_errors.append(error_msg)
         except Exception as e:
-            error_msg = (
-                f"Unexpected error uploading {image.get('name', 'unknown')}: {e}"
-            )
+            error_msg = f"Error uploading {item.get('name', 'unknown')}: {e}"
             print(f"worker-comfyui - {error_msg}")
             upload_errors.append(error_msg)
 
     if upload_errors:
-        print(f"worker-comfyui - image(s) upload finished with errors")
         return {
             "status": "error",
-            "message": "Some images failed to upload",
+            "message": "Some media failed to upload",
             "details": upload_errors,
         }
 
-    print(f"worker-comfyui - image(s) upload complete")
     return {
         "status": "success",
-        "message": "All images uploaded successfully",
+        "message": "All media uploaded successfully",
         "details": responses,
     }
+
+
+def upload_images(images):
+    """Backwards compatibility wrapper for upload_media"""
+    return upload_media(images)
 
 
 def get_available_models():
@@ -567,11 +603,130 @@ def create_zip_archive(binary_outputs, zip_prefix=None):
     return {"filename": zip_filename, "type": "base64", "data": encoded_zip}
 
 
-def execute_workflow_job(runpod_job_id, job_label, workflow, input_images):
+def load_wholebody_workflow(job_data):
+    """
+    Load and populate the Whole Body Replacer workflow.
+    """
+    try:
+        with open(WHOLEBODY_WORKFLOW_PATH, "r") as f:
+            workflow = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"Workflow file not found at {WHOLEBODY_WORKFLOW_PATH}")
+
+    # Helper to set widget values
+    def _set_widget(node_id, widget_index, value):
+        if str(node_id) in workflow:
+            # Some nodes use 'widgets_values'
+            if "widgets_values" in workflow[str(node_id)]:
+                # Ensure list is long enough
+                while len(workflow[str(node_id)]["widgets_values"]) <= widget_index:
+                    workflow[str(node_id)]["widgets_values"].append(None)
+                workflow[str(node_id)]["widgets_values"][widget_index] = value
+            # Some might use inputs (but this JSON format seems to use widgets_values for user inputs)
+            elif "inputs" in workflow[str(node_id)]:
+                 # This depends on the node type, but for the identified nodes:
+                 pass
+
+    # 1. Character Image (Node 311)
+    char_img_name = job_data.get("character_image_name")
+    if char_img_name:
+        _set_widget(311, 0, char_img_name)
+
+    # 2. Reference Video (Node 417)
+    ref_vid_name = job_data.get("reference_video_name")
+    if ref_vid_name:
+        # Widget index 0 is 'video'
+        _set_widget(417, 0, ref_vid_name)
+        # Also update the preview params if present (optional but good for consistency)
+        if "widgets_values" in workflow["417"] and isinstance(workflow["417"]["widgets_values"], dict):
+             workflow["417"]["widgets_values"]["video"] = ref_vid_name
+
+    # 3. Prompt (Node 227)
+    prompt = job_data.get("prompt")
+    if prompt:
+        _set_widget(227, 0, prompt)
+
+    # 4. Negative Prompt (Node 228)
+    neg_prompt = job_data.get("neg_prompt")
+    if neg_prompt:
+        _set_widget(228, 0, neg_prompt)
+
+    # 5. LoRA (Node 315)
+    lora_name = job_data.get("lora_name")
+    if lora_name:
+        _set_widget(315, 0, lora_name)
+        # Ensure node is enabled (mode 0)
+        workflow["315"]["mode"] = 0
+    else:
+        # Bypass/Disable LoRA node if no LoRA provided
+        # Mode 4 is typically 'Bypass' or 'Never'
+        workflow["315"]["mode"] = 4
+
+    # 6. Face Crop (Node 432)
+    use_face_crop = job_data.get("use_face_crop")
+    if use_face_crop:
+        workflow["432"]["mode"] = 0 # Enable
+    else:
+        workflow["432"]["mode"] = 4 # Bypass
+
+    # 7. Dimensions
+    width = job_data.get("width")
+    if width:
+        _set_widget(333, 0, width) # Set_width uses PrimitiveInt inputs? No, Node 333 is SetNode inputting from 330 (Video Width)
+        # Wait, Node 333 is SetNode. The value comes from Node 330 (PrimitiveInt).
+        # Node 330 widgets_values[0] is the value.
+        _set_widget(330, 0, width)
+    
+    height = job_data.get("height")
+    if height:
+        # Node 332 is SetNode, input from Node 331 (Video Height - PrimitiveInt)
+        _set_widget(331, 0, height)
+
+    length = job_data.get("video_length")
+    if length:
+        # Node 383 is Video Length (PrimitiveInt)
+        _set_widget(383, 0, length)
+
+    return workflow
+
+
+def execute_workflow_job(runpod_job_id, job_label, workflow, input_images, job_data=None):
     """
     Execute a single ComfyUI workflow for an individual batch and collect outputs.
     """
     print(f"worker-comfyui - Starting workflow job '{job_label}'")
+    
+    # Handle Whole Body Replacer mode
+    if job_data and job_data.get("mode") == "ref_video_lora":
+        print(f"worker-comfyui - Detected Whole Body Replacer mode for job '{job_label}'")
+        try:
+            workflow = load_wholebody_workflow(job_data)
+            
+            # Prepare uploads for this mode
+            uploads = []
+            if job_data.get("character_image"):
+                uploads.append({
+                    "name": job_data.get("character_image_name"),
+                    "image": job_data.get("character_image")
+                })
+            if job_data.get("reference_video"):
+                uploads.append({
+                    "name": job_data.get("reference_video_name"),
+                    "video": job_data.get("reference_video")
+                })
+            
+            # Upload media
+            upload_result = upload_media(uploads)
+            if upload_result["status"] == "error":
+                raise ValueError(f"Failed to upload media: {upload_result['details']}")
+                
+        except Exception as e:
+            print(f"worker-comfyui - Error preparing wholebody workflow: {e}")
+            return {
+                "result": {"job_label": job_label, "status": "error", "errors": [str(e)]},
+                "binary_outputs": []
+            }
+            
     ws = None
     client_id = str(uuid.uuid4())
     prompt_id = None
@@ -884,7 +1039,8 @@ def handler(job):
         workflow = job_payload["workflow"]
         images = job_payload.get("images") or []
 
-        execution = execute_workflow_job(job_id, job_label, workflow, images)
+        # Pass the full job payload to execute_workflow_job
+        execution = execute_workflow_job(job_id, job_label, workflow, images, job_data=job_payload)
         combined_results.append(execution["result"])
         binary_outputs.extend(execution["binary_outputs"])
 
