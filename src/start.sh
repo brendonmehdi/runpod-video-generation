@@ -9,6 +9,10 @@ comfy-manager-set-mode offline || echo "worker-comfyui - Could not set ComfyUI-M
 
 echo "worker-comfyui: Starting ComfyUI"
 
+echo "[startup] checking model dirs..."
+ls -al /runpod-volume/models 2>/dev/null || echo "[warn] /runpod-volume/models missing or empty"
+ls -al /workspace/models 2>/dev/null || echo "[warn] /workspace/models missing or empty"
+
 # Allow operators to tweak verbosity; default is DEBUG.
 : "${COMFY_LOG_LEVEL:=DEBUG}"
 
