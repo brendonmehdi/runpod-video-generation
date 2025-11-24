@@ -203,6 +203,7 @@ def validate_input(job_input):
             )
 
             validated_jobs.append(
+                {
                     "job_label": job_label,
                     "workflow": workflow,
                     "images": images,
