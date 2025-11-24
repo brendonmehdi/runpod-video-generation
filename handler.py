@@ -870,7 +870,14 @@ def execute_workflow_job(runpod_job_id, job_label, workflow, input_images, job_d
             f"worker-comfyui - Waiting for workflow execution ({prompt_id}) for job '{job_label}'..."
         )
         execution_done = False
+        start_time = time.time()
+        # 10 minute timeout for workflow execution
+        execution_timeout = 600 
+
         while True:
+            if time.time() - start_time > execution_timeout:
+                raise TimeoutError(f"Workflow execution timed out after {execution_timeout} seconds")
+
             try:
                 out = ws.recv()
                 if isinstance(out, str):
